@@ -1,8 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string, send_file
 import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from scipy import stats
 import os
 import io
 import uuid
@@ -10,6 +7,7 @@ from datetime import datetime
 import traceback
 import tempfile
 import base64
+import math
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
@@ -28,404 +26,352 @@ class DataProcessor:
             # 使用BytesIO创建文件对象
             file_obj = io.BytesIO(file_data)
             
-            if filename.endswith('.xlsx') or filename.endswith('.xls'):
+            # 根据文件扩展名选择读取方法
+            if filename.endswith('.xlsx'):
+                self.df = pd.read_excel(file_obj, engine='openpyxl')
+            elif filename.endswith('.xls'):
                 self.df = pd.read_excel(file_obj)
-                code = f"""
-# 数据加载代码
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from scipy import stats
-
-# 加载数据
-df = pd.read_excel('{filename}')
-print(f"数据形状: {self.df.shape}")
-print(f"列名: {list(self.df.columns)}")
-"""
-                self.code_history.append(("数据加载", code))
-                return True, f"成功加载数据，形状: {self.df.shape}"
             else:
-                return False, "不支持的文件格式，请上传Excel文件"
+                return False, "不支持的文件格式"
+            
+            self.code_history = [
+                "import pandas as pd",
+                f"# 读取Excel文件",
+                f"df = pd.read_excel('{filename}')"
+            ]
+            
+            return True, f"成功加载数据，共{self.df.shape[0]}行{self.df.shape[1]}列"
+        
         except Exception as e:
             return False, f"文件加载失败: {str(e)}"
     
     def handle_missing_values(self, method='drop', fill_value=None):
         """处理缺失值"""
-        if self.df is None:
-            return False, "请先上传数据文件", ""
-        
         try:
             original_shape = self.df.shape
             
             if method == 'drop':
                 self.df = self.df.dropna()
-                code = f"""
-# 缺失值处理 - 删除含有缺失值的行
-df_cleaned = df.dropna()
-print(f"原始数据形状: {original_shape}")
-print(f"处理后数据形状: {self.df.shape}")
-"""
-            elif method == 'fill_mean':
-                numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+                code = "df = df.dropna()"
+            elif method == 'mean':
+                numeric_cols = self.df.select_dtypes(include=['number']).columns
                 self.df[numeric_cols] = self.df[numeric_cols].fillna(self.df[numeric_cols].mean())
-                code = f"""
-# 缺失值处理 - 用均值填充数值列
-numeric_cols = df.select_dtypes(include=[np.number]).columns
-df_cleaned = df.copy()
-df_cleaned[numeric_cols] = df_cleaned[numeric_cols].fillna(df_cleaned[numeric_cols].mean())
-print(f"数值列: {list(numeric_cols)}")
-print("用均值填充缺失值")
-"""
-            elif method == 'fill_median':
-                numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+                code = "numeric_cols = df.select_dtypes(include=['number']).columns\ndf[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())"
+            elif method == 'median':
+                numeric_cols = self.df.select_dtypes(include=['number']).columns
                 self.df[numeric_cols] = self.df[numeric_cols].fillna(self.df[numeric_cols].median())
-                code = f"""
-# 缺失值处理 - 用中位数填充数值列
-numeric_cols = df.select_dtypes(include=[np.number]).columns
-df_cleaned = df.copy()
-df_cleaned[numeric_cols] = df_cleaned[numeric_cols].fillna(df_cleaned[numeric_cols].median())
-print(f"数值列: {list(numeric_cols)}")
-print("用中位数填充缺失值")
-"""
-            elif method == 'fill_value' and fill_value is not None:
+                code = "numeric_cols = df.select_dtypes(include=['number']).columns\ndf[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())"
+            elif method == 'value' and fill_value is not None:
                 self.df = self.df.fillna(fill_value)
-                code = f"""
-# 缺失值处理 - 用指定值填充
-df_cleaned = df.fillna({fill_value})
-print(f"用值 {fill_value} 填充所有缺失值")
-"""
+                code = f"df = df.fillna({repr(fill_value)})"
+            else:
+                return False, "无效的缺失值处理方法", ""
             
-            self.code_history.append(("缺失值处理", code))
-            return True, f"缺失值处理完成。原始形状: {original_shape}, 处理后形状: {self.df.shape}", code
+            self.code_history.append(f"# 处理缺失值 - {method}")
+            self.code_history.append(code)
             
+            new_shape = self.df.shape
+            message = f"缺失值处理完成。原始数据: {original_shape[0]}行{original_shape[1]}列，处理后: {new_shape[0]}行{new_shape[1]}列"
+            
+            return True, message, code
+        
         except Exception as e:
             return False, f"缺失值处理失败: {str(e)}", ""
     
     def handle_outliers(self, method='iqr', threshold=3):
         """处理异常值"""
-        if self.df is None:
-            return False, "请先上传数据文件", ""
-        
         try:
-            numeric_cols = self.df.select_dtypes(include=[np.number]).columns
             original_shape = self.df.shape
+            numeric_cols = self.df.select_dtypes(include=['number']).columns
+            
+            if len(numeric_cols) == 0:
+                return False, "没有数值列可以处理异常值", ""
             
             if method == 'iqr':
-                Q1 = self.df[numeric_cols].quantile(0.25)
-                Q3 = self.df[numeric_cols].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                
-                mask = True
                 for col in numeric_cols:
-                    mask = mask & (self.df[col] >= lower_bound[col]) & (self.df[col] <= upper_bound[col])
+                    Q1 = self.df[col].quantile(0.25)
+                    Q3 = self.df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 1.5 * IQR
+                    upper_bound = Q3 + 1.5 * IQR
+                    self.df = self.df[(self.df[col] >= lower_bound) & (self.df[col] <= upper_bound)]
                 
-                self.df = self.df[mask]
-                
-                code = f"""
-# 异常值处理 - IQR方法
-numeric_cols = df.select_dtypes(include=[np.number]).columns
-Q1 = df[numeric_cols].quantile(0.25)
-Q3 = df[numeric_cols].quantile(0.75)
-IQR = Q3 - Q1
-lower_bound = Q1 - 1.5 * IQR
-upper_bound = Q3 + 1.5 * IQR
-
-mask = True
+                code = """# IQR方法处理异常值
+numeric_cols = df.select_dtypes(include=['number']).columns
 for col in numeric_cols:
-    mask = mask & (df[col] >= lower_bound[col]) & (df[col] <= upper_bound[col])
-
-df_no_outliers = df[mask]
-print(f"原始数据形状: {original_shape}")
-print(f"处理后数据形状: {self.df.shape}")
-"""
+    Q1 = df[col].quantile(0.25)
+    Q3 = df[col].quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]"""
             
             elif method == 'zscore':
-                z_scores = np.abs(stats.zscore(self.df[numeric_cols]))
-                mask = (z_scores < threshold).all(axis=1)
-                self.df = self.df[mask]
+                for col in numeric_cols:
+                    mean = self.df[col].mean()
+                    std = self.df[col].std()
+                    if std > 0:
+                        z_scores = abs((self.df[col] - mean) / std)
+                        self.df = self.df[z_scores < threshold]
                 
-                code = f"""
-# 异常值处理 - Z-score方法 (阈值: {threshold})
-from scipy import stats
-import numpy as np
-
-numeric_cols = df.select_dtypes(include=[np.number]).columns
-z_scores = np.abs(stats.zscore(df[numeric_cols]))
-mask = (z_scores < {threshold}).all(axis=1)
-df_no_outliers = df[mask]
-print(f"原始数据形状: {original_shape}")
-print(f"处理后数据形状: {self.df.shape}")
-"""
+                code = f"""# Z-score方法处理异常值
+numeric_cols = df.select_dtypes(include=['number']).columns
+for col in numeric_cols:
+    mean = df[col].mean()
+    std = df[col].std()
+    if std > 0:
+        z_scores = abs((df[col] - mean) / std)
+        df = df[z_scores < {threshold}]"""
             
-            self.code_history.append(("异常值处理", code))
-            return True, f"异常值处理完成。原始形状: {original_shape}, 处理后形状: {self.df.shape}", code
+            self.code_history.append(f"# 处理异常值 - {method}")
+            self.code_history.append(code)
             
+            new_shape = self.df.shape
+            message = f"异常值处理完成。原始数据: {original_shape[0]}行，处理后: {new_shape[0]}行"
+            
+            return True, message, code
+        
         except Exception as e:
             return False, f"异常值处理失败: {str(e)}", ""
     
     def handle_duplicates(self):
         """处理重复值"""
-        if self.df is None:
-            return False, "请先上传数据文件", ""
-        
         try:
             original_shape = self.df.shape
-            duplicates_count = self.df.duplicated().sum()
             self.df = self.df.drop_duplicates()
+            new_shape = self.df.shape
             
-            code = f"""
-# 重复值处理
-print(f"发现重复行数: {duplicates_count}")
-df_no_duplicates = df.drop_duplicates()
-print(f"原始数据形状: {original_shape}")
-print(f"处理后数据形状: {self.df.shape}")
-"""
+            code = "df = df.drop_duplicates()"
+            self.code_history.append("# 删除重复行")
+            self.code_history.append(code)
             
-            self.code_history.append(("重复值处理", code))
-            return True, f"重复值处理完成。删除了 {duplicates_count} 行重复数据。原始形状: {original_shape}, 处理后形状: {self.df.shape}", code
+            removed_count = original_shape[0] - new_shape[0]
+            message = f"重复值处理完成。删除了 {removed_count} 行重复数据，剩余 {new_shape[0]} 行"
             
+            return True, message, code
+        
         except Exception as e:
             return False, f"重复值处理失败: {str(e)}", ""
     
     def standardize_data(self, method='zscore'):
         """数据标准化"""
-        if self.df is None:
-            return False, "请先上传数据文件", ""
-        
         try:
-            numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+            numeric_cols = self.df.select_dtypes(include=['number']).columns
             
-            if not numeric_cols:
-                return False, "没有找到可标准化的数值列", ""
+            if len(numeric_cols) == 0:
+                return False, "没有数值列可以标准化", ""
             
             if method == 'zscore':
-                scaler = StandardScaler()
-                self.df[numeric_cols] = scaler.fit_transform(self.df[numeric_cols])
+                for col in numeric_cols:
+                    mean = self.df[col].mean()
+                    std = self.df[col].std()
+                    if std > 0:
+                        self.df[col] = (self.df[col] - mean) / std
                 
-                code = f"""
-# Z-score标准化
-from sklearn.preprocessing import StandardScaler
-
-numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-scaler = StandardScaler()
-df_standardized = df.copy()
-df_standardized[numeric_cols] = scaler.fit_transform(df_standardized[numeric_cols])
-
-print(f"标准化的列: {numeric_cols}")
-print("使用Z-score标准化: (x - μ) / σ")
-"""
+                code = """# Z-score标准化
+numeric_cols = df.select_dtypes(include=['number']).columns
+for col in numeric_cols:
+    mean = df[col].mean()
+    std = df[col].std()
+    if std > 0:
+        df[col] = (df[col] - mean) / std"""
             
             elif method == 'minmax':
-                scaler = MinMaxScaler()
-                self.df[numeric_cols] = scaler.fit_transform(self.df[numeric_cols])
+                for col in numeric_cols:
+                    min_val = self.df[col].min()
+                    max_val = self.df[col].max()
+                    if max_val > min_val:
+                        self.df[col] = (self.df[col] - min_val) / (max_val - min_val)
                 
-                code = f"""
-# Min-Max标准化
-from sklearn.preprocessing import MinMaxScaler
-
-numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-scaler = MinMaxScaler()
-df_standardized = df.copy()
-df_standardized[numeric_cols] = scaler.fit_transform(df_standardized[numeric_cols])
-
-print(f"标准化的列: {numeric_cols}")
-print("使用Min-Max标准化: (x - min) / (max - min)")
-"""
+                code = """# Min-Max标准化
+numeric_cols = df.select_dtypes(include=['number']).columns
+for col in numeric_cols:
+    min_val = df[col].min()
+    max_val = df[col].max()
+    if max_val > min_val:
+        df[col] = (df[col] - min_val) / (max_val - min_val)"""
             
-            self.code_history.append(("数据标准化", code))
-            return True, f"数据标准化完成。标准化列: {numeric_cols}", code
+            self.code_history.append(f"# 数据标准化 - {method}")
+            self.code_history.append(code)
             
+            message = f"数据标准化完成，使用{method}方法处理了{len(numeric_cols)}个数值列"
+            
+            return True, message, code
+        
         except Exception as e:
             return False, f"数据标准化失败: {str(e)}", ""
     
     def correlation_analysis(self):
         """相关性分析"""
-        if self.df is None:
-            return False, "请先上传数据文件", "", False
-        
         try:
-            numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+            numeric_cols = self.df.select_dtypes(include=['number']).columns
+            
             if len(numeric_cols) < 2:
                 return False, "需要至少2个数值列进行相关性分析", "", False
             
-            code = f"""
-# 相关性分析
-numeric_cols = df.select_dtypes(include=[np.number]).columns
+            corr_matrix = self.df[numeric_cols].corr()
+            
+            code = """# 相关性分析
+import pandas as pd
+numeric_cols = df.select_dtypes(include=['number']).columns
 correlation_matrix = df[numeric_cols].corr()
-
-print("相关性矩阵:")
-print(correlation_matrix)
-
-high_corr_pairs = []
-for i in range(len(correlation_matrix.columns)):
-    for j in range(i+1, len(correlation_matrix.columns)):
-        corr_value = correlation_matrix.iloc[i, j]
-        if abs(corr_value) > 0.7:
-            high_corr_pairs.append((correlation_matrix.columns[i], 
-                                  correlation_matrix.columns[j], 
-                                  corr_value))
-
-print("\\n高相关性特征对 (|r| > 0.7):")
-for pair in high_corr_pairs:
-    print(f"{{pair[0]}} - {{pair[1]}}: {{pair[2]:.3f}}")
-"""
+print(correlation_matrix)"""
             
-            self.code_history.append(("相关性分析", code))
-            return True, f"相关性分析完成。分析了 {len(numeric_cols)} 个数值列", code, False
+            self.code_history.append("# 相关性分析")
+            self.code_history.append(code)
             
+            # 创建相关性结果DataFrame
+            self.df = corr_matrix.round(4)
+            
+            message = f"相关性分析完成，分析了{len(numeric_cols)}个数值列之间的相关性"
+            
+            return True, message, code, True
+        
         except Exception as e:
             return False, f"相关性分析失败: {str(e)}", "", False
     
     def t_test(self, column1, column2=None, value=None):
-        """t检验"""
-        if self.df is None:
-            return False, "请先上传数据文件", "", False
-        
+        """t检验（简化版本，不使用scipy）"""
         try:
             if column1 not in self.df.columns:
                 return False, f"列 '{column1}' 不存在", "", False
             
-            if column2 is not None:
-                # 双样本t检验
+            if not pd.api.types.is_numeric_dtype(self.df[column1]):
+                return False, f"列 '{column1}' 不是数值类型", "", False
+            
+            if column2:  # 双样本t检验
                 if column2 not in self.df.columns:
                     return False, f"列 '{column2}' 不存在", "", False
                 
-                data1 = self.df[column1].dropna()
-                data2 = self.df[column2].dropna()
+                if not pd.api.types.is_numeric_dtype(self.df[column2]):
+                    return False, f"列 '{column2}' 不是数值类型", "", False
                 
-                t_stat, p_value = stats.ttest_ind(data1, data2)
+                sample1 = self.df[column1].dropna()
+                sample2 = self.df[column2].dropna()
                 
-                code = f"""
-# 双样本t检验
-from scipy import stats
-
-data1 = df['{column1}'].dropna()
-data2 = df['{column2}'].dropna()
-
-t_statistic, p_value = stats.ttest_ind(data1, data2)
-
-print(f"双样本t检验结果:")
-print(f"列1: {column1}, 样本数: {{len(data1)}}, 均值: {{data1.mean():.4f}}")
-print(f"列2: {column2}, 样本数: {{len(data2)}}, 均值: {{data2.mean():.4f}}")
-print(f"t统计量: {{t_statistic:.4f}}")
-print(f"p值: {{p_value:.4f}}")
-print(f"显著性水平0.05下{'拒绝' if p_value < 0.05 else '接受'}原假设")
-"""
+                mean1, mean2 = sample1.mean(), sample2.mean()
+                var1, var2 = sample1.var(), sample2.var()
+                n1, n2 = len(sample1), len(sample2)
                 
-                result_text = f"双样本t检验: t统计量={t_stat:.4f}, p值={p_value:.4f}"
+                # 简化的t统计量计算
+                pooled_var = ((n1-1)*var1 + (n2-1)*var2) / (n1+n2-2)
+                t_stat = (mean1 - mean2) / math.sqrt(pooled_var * (1/n1 + 1/n2))
                 
-            elif value is not None:
-                # 单样本t检验
-                data = self.df[column1].dropna()
-                t_stat, p_value = stats.ttest_1samp(data, value)
+                code = f"""# 双样本t检验 (简化版本)
+import math
+sample1 = df['{column1}'].dropna()
+sample2 = df['{column2}'].dropna()
+mean1, mean2 = sample1.mean(), sample2.mean()
+var1, var2 = sample1.var(), sample2.var()
+n1, n2 = len(sample1), len(sample2)
+pooled_var = ((n1-1)*var1 + (n2-1)*var2) / (n1+n2-2)
+t_statistic = (mean1 - mean2) / math.sqrt(pooled_var * (1/n1 + 1/n2))
+print(f'T统计量: {{t_statistic:.4f}}')"""
                 
-                code = f"""
-# 单样本t检验
-from scipy import stats
-
-data = df['{column1}'].dropna()
+                message = f"双样本t检验完成。T统计量: {t_stat:.4f}, 样本1均值: {mean1:.4f}, 样本2均值: {mean2:.4f}"
+                
+            else:  # 单样本t检验
+                if value is None:
+                    return False, "单样本t检验需要指定检验值", "", False
+                
+                sample = self.df[column1].dropna()
+                mean = sample.mean()
+                std = sample.std()
+                n = len(sample)
+                
+                t_stat = (mean - value) / (std / math.sqrt(n))
+                
+                code = f"""# 单样本t检验 (简化版本)
+import math
+sample = df['{column1}'].dropna()
+mean = sample.mean()
+std = sample.std()
+n = len(sample)
 test_value = {value}
-
-t_statistic, p_value = stats.ttest_1samp(data, test_value)
-
-print(f"单样本t检验结果:")
-print(f"列: {column1}, 样本数: {{len(data)}}, 样本均值: {{data.mean():.4f}}")
-print(f"检验值: {value}")
-print(f"t统计量: {{t_statistic:.4f}}")
-print(f"p值: {{p_value:.4f}}")
-print(f"显著性水平0.05下{'拒绝' if p_value < 0.05 else '接受'}原假设")
-"""
+t_statistic = (mean - test_value) / (std / math.sqrt(n))
+print(f'T统计量: {{t_statistic:.4f}}')"""
                 
-                result_text = f"单样本t检验: t统计量={t_stat:.4f}, p值={p_value:.4f}"
+                message = f"单样本t检验完成。T统计量: {t_stat:.4f}, 样本均值: {mean:.4f}, 检验值: {value}"
             
-            else:
-                return False, "请指定第二列或检验值", "", False
+            self.code_history.append("# t检验")
+            self.code_history.append(code)
             
-            self.code_history.append(("t检验", code))
-            return True, result_text, code, False
-            
+            return True, message, code, False
+        
         except Exception as e:
             return False, f"t检验失败: {str(e)}", "", False
     
     def chi_square_test(self, column1, column2):
-        """卡方检验"""
-        if self.df is None:
-            return False, "请先上传数据文件", "", False
-        
+        """卡方检验（简化版本，不使用scipy）"""
         try:
             if column1 not in self.df.columns or column2 not in self.df.columns:
                 return False, "指定的列不存在", "", False
             
-            # 创建列联表
+            # 创建交叉表
             contingency_table = pd.crosstab(self.df[column1], self.df[column2])
             
-            # 卡方检验
-            chi2, p_value, dof, expected = stats.chi2_contingency(contingency_table)
+            # 简化的卡方统计量计算
+            row_totals = contingency_table.sum(axis=1)
+            col_totals = contingency_table.sum(axis=0)
+            total = contingency_table.sum().sum()
             
-            code = f"""
-# 卡方检验
-from scipy import stats
-import pandas as pd
-
-# 创建列联表
+            chi_square = 0
+            for i in range(len(row_totals)):
+                for j in range(len(col_totals)):
+                    observed = contingency_table.iloc[i, j]
+                    expected = (row_totals.iloc[i] * col_totals.iloc[j]) / total
+                    if expected > 0:
+                        chi_square += (observed - expected) ** 2 / expected
+            
+            code = f"""# 卡方检验 (简化版本)
 contingency_table = pd.crosstab(df['{column1}'], df['{column2}'])
-print("列联表:")
-print(contingency_table)
+row_totals = contingency_table.sum(axis=1)
+col_totals = contingency_table.sum(axis=0)
+total = contingency_table.sum().sum()
 
-# 执行卡方检验
-chi2_statistic, p_value, degrees_of_freedom, expected_frequencies = stats.chi2_contingency(contingency_table)
+chi_square = 0
+for i in range(len(row_totals)):
+    for j in range(len(col_totals)):
+        observed = contingency_table.iloc[i, j]
+        expected = (row_totals.iloc[i] * col_totals.iloc[j]) / total
+        if expected > 0:
+            chi_square += (observed - expected) ** 2 / expected
 
-print(f"\\n卡方检验结果:")
-print(f"卡方统计量: {{chi2_statistic:.4f}}")
-print(f"p值: {{p_value:.4f}}")
-print(f"自由度: {{degrees_of_freedom}}")
-print(f"显著性水平0.05下{'拒绝' if p_value < 0.05 else '接受'}原假设(变量独立)")
-
-print(f"\\n期望频率:")
-print(expected_frequencies)
-"""
+print(f'卡方统计量: {{chi_square:.4f}}')
+print(contingency_table)"""
             
-            result_text = f"卡方检验: χ²={chi2:.4f}, p值={p_value:.4f}, 自由度={dof}"
+            self.code_history.append("# 卡方检验")
+            self.code_history.append(code)
             
-            self.code_history.append(("卡方检验", code))
-            return True, result_text, code, False
+            # 将交叉表作为结果
+            self.df = contingency_table
             
+            message = f"卡方检验完成。卡方统计量: {chi_square:.4f}"
+            
+            return True, message, code, True
+        
         except Exception as e:
             return False, f"卡方检验失败: {str(e)}", "", False
     
-    def get_result_excel(self):
-        """获取处理结果的Excel数据"""
-        if self.df is None:
-            return None
-        
-        try:
-            output = io.BytesIO()
-            self.df.to_excel(output, index=False)
-            output.seek(0)
-            return output.getvalue()
-        except Exception as e:
-            return None
-    
     def get_complete_code(self):
         """获取完整的Python代码"""
-        if not self.code_history:
-            return "# 没有执行任何操作"
-        
-        complete_code = "# 完整的数据预处理Python代码\n"
-        complete_code += "# 生成时间: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n"
-        
-        for operation, code in self.code_history:
-            complete_code += f"# {operation}\n"
-            complete_code += code + "\n\n"
-        
-        return complete_code
+        return "\n".join(self.code_history)
+    
+    def to_excel(self):
+        """导出为Excel"""
+        try:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                self.df.to_excel(writer, index=False, sheet_name='processed_data')
+            output.seek(0)
+            return output
+        except Exception as e:
+            raise Exception(f"导出Excel失败: {str(e)}")
 
-# 全局数据处理器
+# 创建全局处理器实例
 processor = DataProcessor()
 
-# HTML模板
+# HTML模板（内联）
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -436,281 +382,307 @@ HTML_TEMPLATE = '''
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.1.3/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        .main-container {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
-            margin: 20px auto;
-            max-width: 1200px;
-            backdrop-filter: blur(10px);
-        }
-        .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            text-align: center;
-            padding: 30px;
-            border-radius: 20px 20px 0 0;
-        }
-        .upload-area {
-            border: 3px dashed #667eea;
-            border-radius: 15px;
-            padding: 50px;
-            text-align: center;
-            margin: 30px;
-            transition: all 0.3s ease;
+        .drag-area {
+            border: 2px dashed #007bff;
+            border-radius: 10px;
             background: #f8f9fa;
+            padding: 40px;
+            text-align: center;
+            transition: all 0.3s ease;
             cursor: pointer;
         }
-        .upload-area:hover {
-            border-color: #764ba2;
+        .drag-area:hover {
             background: #e9ecef;
+            border-color: #0056b3;
+        }
+        .drag-area.drag-over {
+            background: #d4edda;
+            border-color: #28a745;
         }
         .btn-custom {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(45deg, #007bff, #6610f2);
             border: none;
-            border-radius: 25px;
-            padding: 10px 30px;
             color: white;
+            border-radius: 25px;
+            padding: 10px 25px;
             transition: all 0.3s ease;
         }
-        .function-card {
-            background: white;
-            border-radius: 15px;
-            padding: 20px;
-            margin: 15px 0;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        .btn-custom:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,123,255,0.3);
+            color: white;
         }
-        .hidden { display: none; }
-        .code-display {
-            background: #2d3748;
-            color: #e2e8f0;
-            border-radius: 10px;
-            padding: 20px;
-            font-family: 'Monaco', monospace;
-            font-size: 14px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-        }
-        .data-info {
-            background: #f8f9fa;
+        .card {
             border-radius: 15px;
-            padding: 20px;
-            margin: 30px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border: none;
         }
         .nav-pills .nav-link {
-            border-radius: 25px;
+            border-radius: 20px;
             margin: 0 5px;
         }
         .nav-pills .nav-link.active {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(45deg, #007bff, #6610f2);
+        }
+        .code-display {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .form-control, .form-select {
+            border-radius: 10px;
+        }
+        .hide-element {
+            display: none !important;
         }
     </style>
 </head>
-<body>
-    <div class="container-fluid">
-        <div class="main-container">
-            <div class="header">
-                <h1><i class="fas fa-chart-line"></i> 数据预处理在线工具</h1>
-                <p>轻松处理您的Excel数据 - 缺失值、异常值、标准化、统计分析一站式解决</p>
-            </div>
+<body class="bg-light">
+    <div class="container-fluid py-4">
+        <div class="row justify-content-center">
+            <div class="col-lg-10">
+                <div class="text-center mb-4">
+                    <h1 class="display-4 text-primary"><i class="fas fa-chart-line"></i> 数据预处理在线工具</h1>
+                    <p class="lead text-muted">专业的Excel数据处理平台，支持缺失值处理、异常值检测、数据标准化等功能</p>
+                </div>
 
-            <div id="upload-section">
-                <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                    <div style="font-size: 4rem; color: #667eea; margin-bottom: 20px;">
-                        <i class="fas fa-cloud-upload-alt"></i>
+                <!-- 文件上传区域 -->
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <h5 class="card-title"><i class="fas fa-upload"></i> 上传Excel文件</h5>
+                        <div class="drag-area" id="dragArea">
+                            <i class="fas fa-cloud-upload-alt fa-3x text-primary mb-3"></i>
+                            <h6>拖拽Excel文件到此处，或点击选择文件</h6>
+                            <p class="text-muted">支持 .xlsx 和 .xls 格式，最大16MB</p>
+                            <input type="file" id="fileInput" accept=".xlsx,.xls" style="display: none;">
+                        </div>
                     </div>
-                    <h4>点击选择Excel文件</h4>
-                    <p class="text-muted">支持 .xlsx 和 .xls 格式，最大 16MB</p>
-                    <input type="file" id="fileInput" accept=".xlsx,.xls" style="display: none;">
-                    <button class="btn btn-custom mt-3" type="button">
-                        <i class="fas fa-folder-open"></i> 选择文件
-                    </button>
                 </div>
-            </div>
 
-            <div id="data-info-section" class="hidden">
-                <div class="data-info">
-                    <h4><i class="fas fa-info-circle"></i> 数据信息</h4>
-                    <div id="dataInfo"></div>
+                <!-- 数据信息展示 -->
+                <div class="card mb-4 hide-element" id="dataInfoCard">
+                    <div class="card-body">
+                        <h5 class="card-title"><i class="fas fa-info-circle"></i> 数据信息</h5>
+                        <div id="dataInfo"></div>
+                    </div>
                 </div>
-            </div>
 
-            <div id="functions-section" class="hidden">
-                <div class="container">
-                    <h4 class="text-center mb-4"><i class="fas fa-cogs"></i> 选择数据处理功能</h4>
-                    
-                    <!-- 功能标签页 -->
-                    <ul class="nav nav-pills justify-content-center mb-4" role="tablist">
-                        <li class="nav-item" role="presentation">
-                            <button class="nav-link active" id="preprocessing-tab" data-bs-toggle="pill" data-bs-target="#preprocessing" type="button">
-                                <i class="fas fa-broom"></i> 数据清洗
-                            </button>
-                        </li>
-                        <li class="nav-item" role="presentation">
-                            <button class="nav-link" id="standardization-tab" data-bs-toggle="pill" data-bs-target="#standardization" type="button">
-                                <i class="fas fa-balance-scale"></i> 数据标准化
-                            </button>
-                        </li>
-                        <li class="nav-item" role="presentation">
-                            <button class="nav-link" id="analysis-tab" data-bs-toggle="pill" data-bs-target="#analysis" type="button">
-                                <i class="fas fa-chart-bar"></i> 统计分析
-                            </button>
-                        </li>
-                    </ul>
+                <!-- 功能选择区域 -->
+                <div class="card mb-4 hide-element" id="functionsCard">
+                    <div class="card-body">
+                        <h5 class="card-title"><i class="fas fa-cogs"></i> 选择处理功能</h5>
+                        
+                        <ul class="nav nav-pills mb-4" id="functionTabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="missing-tab" data-bs-toggle="pill" data-bs-target="#missing" type="button">
+                                    <i class="fas fa-exclamation-triangle"></i> 缺失值处理
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="outlier-tab" data-bs-toggle="pill" data-bs-target="#outlier" type="button">
+                                    <i class="fas fa-search"></i> 异常值处理
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="duplicate-tab" data-bs-toggle="pill" data-bs-target="#duplicate" type="button">
+                                    <i class="fas fa-copy"></i> 重复值处理
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="standardization-tab" data-bs-toggle="pill" data-bs-target="#standardization" type="button">
+                                    <i class="fas fa-balance-scale"></i> 数据标准化
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="correlation-tab" data-bs-toggle="pill" data-bs-target="#correlation" type="button">
+                                    <i class="fas fa-project-diagram"></i> 相关性分析
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="ttest-tab" data-bs-toggle="pill" data-bs-target="#ttest" type="button">
+                                    <i class="fas fa-calculator"></i> t检验
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="chisquare-tab" data-bs-toggle="pill" data-bs-target="#chisquare" type="button">
+                                    <i class="fas fa-table"></i> 卡方检验
+                                </button>
+                            </li>
+                        </ul>
 
-                    <!-- 功能内容 -->
-                    <div class="tab-content">
-                        <!-- 数据清洗 -->
-                        <div class="tab-pane fade show active" id="preprocessing">
-                            <div class="row">
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-exclamation-triangle"></i> 缺失值处理</h5>
-                                        <select class="form-select mb-3" id="missingMethod">
+                        <div class="tab-content" id="functionTabContent">
+                            <!-- 缺失值处理 -->
+                            <div class="tab-pane fade show active" id="missing" role="tabpanel">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <label class="form-label">处理方法：</label>
+                                        <select class="form-select" id="missingMethod">
                                             <option value="drop">删除含缺失值的行</option>
-                                            <option value="fill_mean">用均值填充</option>
-                                            <option value="fill_median">用中位数填充</option>
-                                            <option value="fill_value">用指定值填充</option>
+                                            <option value="mean">用均值填充</option>
+                                            <option value="median">用中位数填充</option>
+                                            <option value="value">用指定值填充</option>
                                         </select>
-                                        <div class="mb-3" id="fillValueDiv" style="display: none;">
-                                            <input type="number" class="form-control" id="fillValue" placeholder="填充值" step="any">
-                                        </div>
-                                        <button class="btn btn-custom w-100" onclick="processMissingValues()">执行处理</button>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">填充值：</label>
+                                        <input type="text" class="form-control" id="fillValue" placeholder="仅在选择指定值填充时使用" disabled>
                                     </div>
                                 </div>
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-search"></i> 异常值处理</h5>
-                                        <select class="form-select mb-3" id="outlierMethod">
+                                <div class="mt-3">
+                                    <button class="btn btn-custom" onclick="processMissingValues()">
+                                        <i class="fas fa-play"></i> 处理缺失值
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- 异常值处理 -->
+                            <div class="tab-pane fade" id="outlier" role="tabpanel">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <label class="form-label">检测方法：</label>
+                                        <select class="form-select" id="outlierMethod">
                                             <option value="iqr">IQR方法</option>
                                             <option value="zscore">Z-score方法</option>
                                         </select>
-                                        <div class="mb-3" id="thresholdDiv" style="display: none;">
-                                            <input type="number" class="form-control" id="zThreshold" placeholder="Z-score阈值" value="3" step="0.1">
-                                        </div>
-                                        <button class="btn btn-custom w-100" onclick="processOutliers()">执行处理</button>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Z-score阈值：</label>
+                                        <input type="number" class="form-control" id="zscoreThreshold" value="3" step="0.1" disabled>
                                     </div>
                                 </div>
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-copy"></i> 重复值处理</h5>
-                                        <p class="text-muted">自动检测并删除重复的行</p>
-                                        <button class="btn btn-custom w-100" onclick="processDuplicates()">执行处理</button>
-                                    </div>
+                                <div class="mt-3">
+                                    <button class="btn btn-custom" onclick="processOutliers()">
+                                        <i class="fas fa-play"></i> 处理异常值
+                                    </button>
                                 </div>
                             </div>
-                        </div>
 
-                        <!-- 数据标准化 -->
-                        <div class="tab-pane fade" id="standardization">
-                            <div class="row justify-content-center">
-                                <div class="col-md-6">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-ruler"></i> 数据标准化</h5>
-                                        <select class="form-select mb-3" id="standardizationMethod">
+                            <!-- 重复值处理 -->
+                            <div class="tab-pane fade" id="duplicate" role="tabpanel">
+                                <p class="text-muted">自动检测并删除完全重复的数据行</p>
+                                <button class="btn btn-custom" onclick="processDuplicates()">
+                                    <i class="fas fa-play"></i> 删除重复值
+                                </button>
+                            </div>
+
+                            <!-- 数据标准化 -->
+                            <div class="tab-pane fade" id="standardization" role="tabpanel">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <label class="form-label">标准化方法：</label>
+                                        <select class="form-select" id="standardMethod">
                                             <option value="zscore">Z-score标准化</option>
                                             <option value="minmax">Min-Max标准化</option>
                                         </select>
-                                        <div class="mb-3">
-                                            <small class="text-muted">
-                                                Z-score: (x - μ) / σ<br>
-                                                Min-Max: (x - min) / (max - min)
-                                            </small>
-                                        </div>
-                                        <button class="btn btn-custom w-100" onclick="processStandardization()">执行标准化</button>
                                     </div>
+                                </div>
+                                <div class="mt-3">
+                                    <button class="btn btn-custom" onclick="processStandardization()">
+                                        <i class="fas fa-play"></i> 数据标准化
+                                    </button>
                                 </div>
                             </div>
-                        </div>
 
-                        <!-- 统计分析 -->
-                        <div class="tab-pane fade" id="analysis">
-                            <div class="row">
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-project-diagram"></i> 相关性分析</h5>
-                                        <p class="text-muted">分析数值列之间的相关性</p>
-                                        <button class="btn btn-custom w-100" onclick="processCorrelation()">执行分析</button>
+                            <!-- 相关性分析 -->
+                            <div class="tab-pane fade" id="correlation" role="tabpanel">
+                                <p class="text-muted">计算数值列之间的皮尔逊相关系数矩阵</p>
+                                <button class="btn btn-custom" onclick="processCorrelation()">
+                                    <i class="fas fa-play"></i> 相关性分析
+                                </button>
+                            </div>
+
+                            <!-- t检验 -->
+                            <div class="tab-pane fade" id="ttest" role="tabpanel">
+                                <div class="row">
+                                    <div class="col-md-4">
+                                        <label class="form-label">检验类型：</label>
+                                        <select class="form-select" id="tTestType">
+                                            <option value="one_sample">单样本t检验</option>
+                                            <option value="two_sample">双样本t检验</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">列1：</label>
+                                        <select class="form-select" id="tTestCol1">
+                                            <option value="">请选择列</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label">列2：</label>
+                                        <select class="form-select" id="tTestCol2" disabled>
+                                            <option value="">请选择列</option>
+                                        </select>
                                     </div>
                                 </div>
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-calculator"></i> t检验</h5>
-                                        <div class="mb-3">
-                                            <select class="form-select" id="tTestColumn1">
-                                                <option value="">选择第一列</option>
-                                            </select>
-                                        </div>
-                                        <div class="mb-3">
-                                            <select class="form-select" id="tTestType">
-                                                <option value="two_sample">双样本检验</option>
-                                                <option value="one_sample">单样本检验</option>
-                                            </select>
-                                        </div>
-                                        <div class="mb-3" id="tTestColumn2Div">
-                                            <select class="form-select" id="tTestColumn2">
-                                                <option value="">选择第二列</option>
-                                            </select>
-                                        </div>
-                                        <div class="mb-3" id="tTestValueDiv" style="display: none;">
-                                            <input type="number" class="form-control" id="tTestValue" placeholder="检验值" step="any">
-                                        </div>
-                                        <button class="btn btn-custom w-100" onclick="processTTest()">执行检验</button>
+                                <div class="row mt-3">
+                                    <div class="col-md-4">
+                                        <label class="form-label">检验值：</label>
+                                        <input type="number" class="form-control" id="tTestValue" placeholder="单样本检验的检验值" step="any">
                                     </div>
                                 </div>
-                                <div class="col-md-4">
-                                    <div class="function-card">
-                                        <h5><i class="fas fa-th"></i> 卡方检验</h5>
-                                        <div class="mb-3">
-                                            <select class="form-select" id="chiSquareColumn1">
-                                                <option value="">选择第一列</option>
-                                            </select>
-                                        </div>
-                                        <div class="mb-3">
-                                            <select class="form-select" id="chiSquareColumn2">
-                                                <option value="">选择第二列</option>
-                                            </select>
-                                        </div>
-                                        <button class="btn btn-custom w-100" onclick="processChiSquare()">执行检验</button>
+                                <div class="mt-3">
+                                    <button class="btn btn-custom" onclick="processTTest()">
+                                        <i class="fas fa-play"></i> 执行t检验
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- 卡方检验 -->
+                            <div class="tab-pane fade" id="chisquare" role="tabpanel">
+                                <div class="row">
+                                    <div class="col-md-6">
+                                        <label class="form-label">列1：</label>
+                                        <select class="form-select" id="chiCol1">
+                                            <option value="">请选择列</option>
+                                        </select>
                                     </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">列2：</label>
+                                        <select class="form-select" id="chiCol2">
+                                            <option value="">请选择列</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="mt-3">
+                                    <button class="btn btn-custom" onclick="processChiSquare()">
+                                        <i class="fas fa-play"></i> 执行卡方检验
+                                    </button>
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <div id="loading" class="hidden text-center p-5">
-                <div class="spinner-border text-primary" role="status"></div>
-                <p class="mt-3">正在处理数据，请稍候...</p>
-            </div>
-
-            <div id="result-section" class="hidden">
-                <div class="container">
-                    <div id="resultMessage"></div>
-                    <div id="downloadSection" class="text-center mb-4">
-                        <button class="btn btn-success btn-lg" onclick="downloadResult()">
-                            <i class="fas fa-download"></i> 下载处理后的Excel文件
-                        </button>
-                    </div>
-                    <div class="mb-4">
-                        <h5><i class="fas fa-code"></i> 完整Python代码</h5>
-                        <div class="d-flex justify-content-end mb-2">
-                            <button class="btn btn-outline-secondary btn-sm" onclick="copyCode()">
-                                <i class="fas fa-copy"></i> 复制代码
+                <!-- 处理结果 -->
+                <div class="card hide-element" id="resultCard">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h5 class="card-title mb-0"><i class="fas fa-check-circle text-success"></i> 处理结果</h5>
+                            <button class="btn btn-success" id="downloadBtn" onclick="downloadResult()">
+                                <i class="fas fa-download"></i> 下载处理后的文件
                             </button>
                         </div>
-                        <div class="code-display" id="pythonCode"></div>
-                    </div>
-                    <div class="text-center">
-                        <button class="btn btn-custom" onclick="resetProcessor()">
-                            <i class="fas fa-refresh"></i> 处理新文件
-                        </button>
+                        <div class="alert alert-success" id="resultMessage"></div>
+                        <div class="mb-4">
+                            <h5><i class="fas fa-code"></i> 完整Python代码</h5>
+                            <div class="d-flex justify-content-end mb-2">
+                                <button class="btn btn-outline-secondary btn-sm" onclick="copyCode()">
+                                    <i class="fas fa-copy"></i> 复制代码
+                                </button>
+                            </div>
+                            <div class="code-display" id="pythonCode"></div>
+                        </div>
+                        <div class="text-center">
+                            <button class="btn btn-custom" onclick="resetProcessor()">
+                                <i class="fas fa-refresh"></i> 处理新文件
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -750,117 +722,153 @@ HTML_TEMPLATE = '''
                 alert('文件大小不能超过16MB');
                 return;
             }
-            
-            showLoading(true);
-            
+
             const reader = new FileReader();
             reader.onload = function(e) {
-                uploadFile(e.target.result, file.name);
+                const fileContent = e.target.result;
+                uploadFile(fileContent, file.name);
             };
             reader.readAsDataURL(file);
         }
 
-        function uploadFile(fileContent, filename) {
-            fetch('/upload', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    file_content: fileContent,
-                    filename: filename
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                showLoading(false);
+        // 拖拽功能
+        const dragArea = document.getElementById('dragArea');
+        
+        dragArea.addEventListener('click', () => {
+            document.getElementById('fileInput').click();
+        });
+
+        dragArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dragArea.classList.add('drag-over');
+        });
+
+        dragArea.addEventListener('dragleave', () => {
+            dragArea.classList.remove('drag-over');
+        });
+
+        dragArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dragArea.classList.remove('drag-over');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFile(files[0]);
+            }
+        });
+
+        async function uploadFile(fileContent, filename) {
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        file_content: fileContent,
+                        filename: filename
+                    })
+                });
+
+                const data = await response.json();
+                
                 if (data.success) {
                     currentDataInfo = data.data_info;
-                    displayDataInfo(data.data_info);
-                    populateColumnSelects(data.data_info.columns);
-                    showSection('data-info-section');
-                    showSection('functions-section');
-                    hideSection('upload-section');
-                    showAlert(data.message, 'success');
+                    showDataInfo(data.data_info);
+                    showFunctionCards();
+                    populateColumnSelects();
                 } else {
-                    showAlert(data.message, 'danger');
+                    alert('上传失败: ' + data.message);
                 }
-            })
-            .catch(error => {
-                showLoading(false);
-                showAlert('上传失败：' + error.message, 'danger');
-            });
+            } catch (error) {
+                alert('上传过程中发生错误: ' + error.message);
+            }
         }
 
-        function displayDataInfo(dataInfo) {
-            let missingHtml = '';
-            let hasMissing = false;
-            
-            for (const [col, count] of Object.entries(dataInfo.missing_values)) {
-                if (count > 0) {
-                    missingHtml += `<p><strong>${col}：</strong> ${count} 个缺失值</p>`;
-                    hasMissing = true;
-                }
-            }
-            
-            if (!hasMissing) {
-                missingHtml = '<p class="text-success">无缺失值</p>';
-            }
-
+        function showDataInfo(info) {
             const html = `
                 <div class="row">
-                    <div class="col-md-6">
-                        <h6><i class="fas fa-table"></i> 基本信息</h6>
-                        <p><strong>数据形状：</strong> ${dataInfo.shape[0]} 行 × ${dataInfo.shape[1]} 列</p>
-                        <p><strong>列名：</strong> ${dataInfo.columns.join(', ')}</p>
+                    <div class="col-md-4">
+                        <h6>数据维度</h6>
+                        <p class="text-primary">${info.shape[0]} 行 × ${info.shape[1]} 列</p>
                     </div>
-                    <div class="col-md-6">
-                        <h6><i class="fas fa-exclamation-circle"></i> 缺失值统计</h6>
-                        ${missingHtml}
+                    <div class="col-md-4">
+                        <h6>列名</h6>
+                        <p class="text-secondary">${info.columns.join(', ')}</p>
+                    </div>
+                    <div class="col-md-4">
+                        <h6>缺失值统计</h6>
+                        <p class="text-warning">${Object.entries(info.missing_values).map(([col, count]) => count > 0 ? `${col}: ${count}` : '').filter(Boolean).join(', ') || '无缺失值'}</p>
                     </div>
                 </div>
             `;
+            
             document.getElementById('dataInfo').innerHTML = html;
+            document.getElementById('dataInfoCard').classList.remove('hide-element');
         }
 
-        function populateColumnSelects(columns) {
-            const selects = ['tTestColumn1', 'tTestColumn2', 'chiSquareColumn1', 'chiSquareColumn2'];
+        function showFunctionCards() {
+            document.getElementById('functionsCard').classList.remove('hide-element');
+        }
+
+        function populateColumnSelects() {
+            if (!currentDataInfo) return;
+            
+            const columns = currentDataInfo.columns;
+            const selects = ['tTestCol1', 'tTestCol2', 'chiCol1', 'chiCol2'];
             
             selects.forEach(selectId => {
                 const select = document.getElementById(selectId);
-                if (select) {
-                    select.innerHTML = '<option value="">选择列</option>';
-                    columns.forEach(col => {
-                        const option = document.createElement('option');
-                        option.value = col;
-                        option.textContent = col;
-                        select.appendChild(option);
-                    });
-                }
+                select.innerHTML = '<option value="">请选择列</option>';
+                columns.forEach(col => {
+                    select.innerHTML += `<option value="${col}">${col}</option>`;
+                });
             });
         }
 
         function toggleFillValue() {
             const method = document.getElementById('missingMethod').value;
-            const fillValueDiv = document.getElementById('fillValueDiv');
-            fillValueDiv.style.display = method === 'fill_value' ? 'block' : 'none';
+            const fillValueInput = document.getElementById('fillValue');
+            fillValueInput.disabled = method !== 'value';
         }
 
         function toggleThreshold() {
             const method = document.getElementById('outlierMethod').value;
-            const thresholdDiv = document.getElementById('thresholdDiv');
-            thresholdDiv.style.display = method === 'zscore' ? 'block' : 'none';
+            const thresholdInput = document.getElementById('zscoreThreshold');
+            thresholdInput.disabled = method !== 'zscore';
         }
 
         function toggleTTestInputs() {
             const testType = document.getElementById('tTestType').value;
-            const column2Div = document.getElementById('tTestColumn2Div');
-            const valueDiv = document.getElementById('tTestValueDiv');
+            const col2Select = document.getElementById('tTestCol2');
+            const valueInput = document.getElementById('tTestValue');
             
             if (testType === 'two_sample') {
-                column2Div.style.display = 'block';
-                valueDiv.style.display = 'none';
+                col2Select.disabled = false;
+                valueInput.disabled = true;
             } else {
-                column2Div.style.display = 'none';
-                valueDiv.style.display = 'block';
+                col2Select.disabled = true;
+                valueInput.disabled = false;
+            }
+        }
+
+        async function processData(operation, parameters) {
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        operation: operation,
+                        parameters: parameters
+                    })
+                });
+
+                const data = await response.json();
+                showResult(data);
+            } catch (error) {
+                alert('处理过程中发生错误: ' + error.message);
             }
         }
 
@@ -868,9 +876,9 @@ HTML_TEMPLATE = '''
             const method = document.getElementById('missingMethod').value;
             const fillValue = document.getElementById('fillValue').value;
             
-            const params = { method };
-            if (method === 'fill_value' && fillValue !== '') {
-                params.fill_value = parseFloat(fillValue);
+            const params = { method: method };
+            if (method === 'value' && fillValue) {
+                params.fill_value = isNaN(fillValue) ? fillValue : parseFloat(fillValue);
             }
             
             processData('missing_values', params);
@@ -878,14 +886,9 @@ HTML_TEMPLATE = '''
 
         function processOutliers() {
             const method = document.getElementById('outlierMethod').value;
-            const threshold = document.getElementById('zThreshold').value;
+            const threshold = parseFloat(document.getElementById('zscoreThreshold').value);
             
-            const params = { method };
-            if (method === 'zscore') {
-                params.threshold = parseFloat(threshold);
-            }
-            
-            processData('outliers', params);
+            processData('outliers', { method: method, threshold: threshold });
         }
 
         function processDuplicates() {
@@ -893,8 +896,8 @@ HTML_TEMPLATE = '''
         }
 
         function processStandardization() {
-            const method = document.getElementById('standardizationMethod').value;
-            processData('standardization', { method });
+            const method = document.getElementById('standardMethod').value;
+            processData('standardization', { method: method });
         }
 
         function processCorrelation() {
@@ -902,27 +905,27 @@ HTML_TEMPLATE = '''
         }
 
         function processTTest() {
-            const column1 = document.getElementById('tTestColumn1').value;
             const testType = document.getElementById('tTestType').value;
+            const col1 = document.getElementById('tTestCol1').value;
+            const col2 = document.getElementById('tTestCol2').value;
+            const value = document.getElementById('tTestValue').value;
             
-            if (!column1) {
-                showAlert('请选择第一列', 'warning');
+            if (!col1) {
+                alert('请选择列1');
                 return;
             }
             
-            const params = { column1 };
+            const params = { column1: col1 };
             
             if (testType === 'two_sample') {
-                const column2 = document.getElementById('tTestColumn2').value;
-                if (!column2) {
-                    showAlert('请选择第二列', 'warning');
+                if (!col2) {
+                    alert('请选择列2');
                     return;
                 }
-                params.column2 = column2;
+                params.column2 = col2;
             } else {
-                const value = document.getElementById('tTestValue').value;
-                if (value === '') {
-                    showAlert('请输入检验值', 'warning');
+                if (!value) {
+                    alert('请输入检验值');
                     return;
                 }
                 params.value = parseFloat(value);
@@ -932,117 +935,74 @@ HTML_TEMPLATE = '''
         }
 
         function processChiSquare() {
-            const column1 = document.getElementById('chiSquareColumn1').value;
-            const column2 = document.getElementById('chiSquareColumn2').value;
+            const col1 = document.getElementById('chiCol1').value;
+            const col2 = document.getElementById('chiCol2').value;
             
-            if (!column1 || !column2) {
-                showAlert('请选择两列进行卡方检验', 'warning');
+            if (!col1 || !col2) {
+                alert('请选择两个列');
                 return;
             }
             
-            processData('chi_square', { column1, column2 });
+            processData('chi_square', { column1: col1, column2: col2 });
         }
 
-        function processData(operation, parameters) {
-            showLoading(true);
-            hideSection('result-section');
-            
-            fetch('/process', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    operation: operation,
-                    parameters: parameters
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
-                showLoading(false);
-                displayResult(data);
-            })
-            .catch(error => {
-                showLoading(false);
-                showAlert('处理失败：' + error.message, 'danger');
-            });
+        function showResult(data) {
+            if (data.success) {
+                document.getElementById('resultMessage').textContent = data.message;
+                document.getElementById('pythonCode').textContent = data.code;
+                
+                const downloadBtn = document.getElementById('downloadBtn');
+                if (data.can_download) {
+                    downloadBtn.style.display = 'block';
+                } else {
+                    downloadBtn.style.display = 'none';
+                }
+                
+                document.getElementById('resultCard').classList.remove('hide-element');
+                document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+            } else {
+                alert('处理失败: ' + data.message);
+            }
         }
 
-        function displayResult(data) {
-            const resultMessage = document.getElementById('resultMessage');
-            const pythonCode = document.getElementById('pythonCode');
-            const downloadSection = document.getElementById('downloadSection');
-            
-            const messageClass = data.success ? 'alert-success' : 'alert-danger';
-            resultMessage.innerHTML = `<div class="alert ${messageClass}">${data.message}</div>`;
-            
-            pythonCode.textContent = data.complete_code;
-            
-            downloadSection.style.display = data.can_download ? 'block' : 'none';
-            
-            showSection('result-section');
-            
-            document.getElementById('result-section').scrollIntoView({ behavior: 'smooth' });
-        }
-
-        function downloadResult() {
-            window.location.href = '/download';
+        async function downloadResult() {
+            try {
+                const response = await fetch('/download');
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = 'processed_data.xlsx';
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                } else {
+                    alert('下载失败');
+                }
+            } catch (error) {
+                alert('下载过程中发生错误: ' + error.message);
+            }
         }
 
         function copyCode() {
-            const codeElement = document.getElementById('pythonCode');
-            const textArea = document.createElement('textarea');
-            textArea.value = codeElement.textContent;
-            document.body.appendChild(textArea);
-            textArea.select();
-            document.execCommand('copy');
-            document.body.removeChild(textArea);
-            
-            showAlert('代码已复制到剪贴板', 'success');
-        }
-
-        function resetProcessor() {
-            fetch('/reset', { method: 'POST' })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    hideSection('data-info-section');
-                    hideSection('functions-section');
-                    hideSection('result-section');
-                    showSection('upload-section');
-                    document.getElementById('fileInput').value = '';
-                    showAlert(data.message, 'success');
-                }
+            const codeText = document.getElementById('pythonCode').textContent;
+            navigator.clipboard.writeText(codeText).then(() => {
+                alert('代码已复制到剪贴板');
+            }).catch(() => {
+                alert('复制失败，请手动选择代码');
             });
         }
 
-        function showSection(sectionId) {
-            document.getElementById(sectionId).classList.remove('hidden');
-        }
-
-        function hideSection(sectionId) {
-            document.getElementById(sectionId).classList.add('hidden');
-        }
-
-        function showLoading(show) {
-            const loading = document.getElementById('loading');
-            loading.style.display = show ? 'block' : 'none';
-        }
-
-        function showAlert(message, type) {
-            const alertDiv = document.createElement('div');
-            alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
-            alertDiv.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
-            alertDiv.innerHTML = `
-                ${message}
-                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-            `;
-            
-            document.body.appendChild(alertDiv);
-            
-            setTimeout(() => {
-                if (alertDiv.parentNode) {
-                    alertDiv.parentNode.removeChild(alertDiv);
-                }
-            }, 3000);
+        async function resetProcessor() {
+            try {
+                await fetch('/reset', { method: 'POST' });
+                location.reload();
+            } catch (error) {
+                location.reload();
+            }
         }
     </script>
 </body>
@@ -1127,38 +1087,25 @@ def process_data():
         return jsonify({
             'success': success,
             'message': message,
-            'code': code,
-            'complete_code': complete_code,
-            'can_download': can_download and success
+            'code': complete_code,
+            'can_download': can_download
         })
     
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'处理失败: {str(e)}',
-            'code': "",
-            'complete_code': processor.get_complete_code(),
-            'can_download': False
-        })
+        return jsonify({'success': False, 'message': f'处理失败: {str(e)}'})
 
 @app.route('/download')
-def download_result():
+def download_file():
     try:
-        excel_data = processor.get_result_excel()
-        if excel_data:
-            filename = f'processed_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-            
-            response = app.response_class(
-                excel_data,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                headers={"Content-disposition": f"attachment; filename={filename}"}
-            )
-            return response
-        else:
-            return jsonify({'success': False, 'message': '没有可下载的数据'})
-    
+        excel_file = processor.to_excel()
+        return send_file(
+            excel_file,
+            as_attachment=True,
+            download_name='processed_data.xlsx',
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
     except Exception as e:
-        return jsonify({'success': False, 'message': f'下载失败: {str(e)}'})
+        return jsonify({'error': f'下载失败: {str(e)}'}), 500
 
 @app.route('/reset', methods=['POST'])
 def reset_processor():
